@@ -1,0 +1,302 @@
+diff --git a/node_modules/@api.video/react-native-livestream/android/src/main/java/video/api/reactnative/livestream/LiveStreamViewManager.kt b/node_modules/@api.video/react-native-livestream/android/src/main/java/video/api/reactnative/livestream/LiveStreamViewManager.kt
+index 0a958fb..4b6d403 100644
+--- a/node_modules/@api.video/react-native-livestream/android/src/main/java/video/api/reactnative/livestream/LiveStreamViewManager.kt
++++ b/node_modules/@api.video/react-native-livestream/android/src/main/java/video/api/reactnative/livestream/LiveStreamViewManager.kt
+@@ -93,6 +93,10 @@ class LiveStreamViewManager : LiveStreamViewManagerSpec<LiveStreamView>() {
+     view.enablePinchedZoom = value
+   }
+ 
++  // Score overlay is only implemented on iOS.
++  @ReactProp(name = ViewProps.SCORE_OVERLAY)
++  override fun setScoreOverlay(view: LiveStreamView, value: String?) {}
++
+   @ReactProp(name = ViewProps.ZOOM_RATIO)
+   override fun setZoomRatio(view: LiveStreamView, value: Float) {
+     view.zoomRatio = value
+diff --git a/node_modules/@api.video/react-native-livestream/android/src/main/java/video/api/reactnative/livestream/ViewProps.kt b/node_modules/@api.video/react-native-livestream/android/src/main/java/video/api/reactnative/livestream/ViewProps.kt
+index 51d3cf0..c844841 100644
+--- a/node_modules/@api.video/react-native-livestream/android/src/main/java/video/api/reactnative/livestream/ViewProps.kt
++++ b/node_modules/@api.video/react-native-livestream/android/src/main/java/video/api/reactnative/livestream/ViewProps.kt
+@@ -9,6 +9,7 @@ object ViewProps {
+   const val IS_MUTED = "isMuted"
+   const val CAMERA = "camera"
+   const val ZOOM_RATIO = "zoomRatio"
++  const val SCORE_OVERLAY = "scoreOverlay"
+   const val ZOOM_ENABLED = "enablePinchedZoom"
+ 
+   // Audio and video configurations
+diff --git a/node_modules/@api.video/react-native-livestream/android/src/oldarch/LiveStreamViewManagerSpec.kt b/node_modules/@api.video/react-native-livestream/android/src/oldarch/LiveStreamViewManagerSpec.kt
+index d1a0e92..ceaca49 100644
+--- a/node_modules/@api.video/react-native-livestream/android/src/oldarch/LiveStreamViewManagerSpec.kt
++++ b/node_modules/@api.video/react-native-livestream/android/src/oldarch/LiveStreamViewManagerSpec.kt
+@@ -12,6 +12,7 @@ abstract class LiveStreamViewManagerSpec<T : View> : SimpleViewManager<T>() {
+   abstract fun setAudio(view: T, value: ReadableMap?)
+   abstract fun setZoomRatio(view: T, value: Float)
+   abstract fun setEnablePinchedZoom(view: T, value: Boolean)
++  abstract fun setScoreOverlay(view: T, value: String?)
+ 
+   abstract fun startStreaming(view: T, requestId: Int, streamKey: String, url: String?)
+   abstract fun stopStreaming(view: T)
+diff --git a/node_modules/@api.video/react-native-livestream/ios/RNLiveStreamView.mm b/node_modules/@api.video/react-native-livestream/ios/RNLiveStreamView.mm
+index 0f6553c..0534bf3 100644
+--- a/node_modules/@api.video/react-native-livestream/ios/RNLiveStreamView.mm
++++ b/node_modules/@api.video/react-native-livestream/ios/RNLiveStreamView.mm
+@@ -135,6 +135,10 @@ - (void)updateProps:(Props::Shared const &)props oldProps:(Props::Shared const &
+         [view setEnablePinchedZoom:newViewProps.enablePinchedZoom];
+     }
+     
++    if (oldViewProps.scoreOverlay != newViewProps.scoreOverlay) {
++        [view setScoreOverlay:RCTNSStringFromString(newViewProps.scoreOverlay)];
++    }
++
+     [super updateProps:props oldProps:oldProps];
+ }
+ 
+diff --git a/node_modules/@api.video/react-native-livestream/ios/RNLiveStreamViewImpl.swift b/node_modules/@api.video/react-native-livestream/ios/RNLiveStreamViewImpl.swift
+index 5b23bc9..93cd534 100644
+--- a/node_modules/@api.video/react-native-livestream/ios/RNLiveStreamViewImpl.swift
++++ b/node_modules/@api.video/react-native-livestream/ios/RNLiveStreamViewImpl.swift
+@@ -7,6 +7,8 @@ import ApiVideoLiveStream
+ import AVFoundation
+ import CoreGraphics
+ import Foundation
++import HaishinKit
++import UIKit
+ 
+ extension String {
+     func toCaptureDevicePosition() -> AVCaptureDevice.Position {
+@@ -38,6 +40,8 @@ extension AVCaptureDevice.Position {
+ public class RNLiveStreamViewImpl: UIView {
+     private var liveStream: ApiVideoLiveStream!
+     private var isStreaming: Bool = false
++    private var scoreEffect: ScoreOverlayEffect?
++    private var isScoreEffectRegistered = false
+ 
+     private lazy var zoomGesture: UIPinchGestureRecognizer = .init(target: self, action: #selector(zoom(sender:)))
+     private let pinchZoomMultiplier: CGFloat = 2.2
+@@ -53,6 +57,88 @@ public class RNLiveStreamViewImpl: UIView {
+         }
+ 
+         addGestureRecognizer(zoomGesture)
++
++        // ApiVideoLiveStream only reads the interface orientation once, at init.
++        UIDevice.current.beginGeneratingDeviceOrientationNotifications()
++        NotificationCenter.default.addObserver(
++            self,
++            selector: #selector(deviceOrientationDidChange),
++            name: UIDevice.orientationDidChangeNotification,
++            object: nil
++        )
++    }
++
++    deinit {
++        NotificationCenter.default.removeObserver(self)
++        UIDevice.current.endGeneratingDeviceOrientationNotifications()
++    }
++
++    /// `rtmpStream` is private in ApiVideoLiveStream; reach it by reflection to register a video effect.
++    private var rtmpStream: RTMPStream? {
++        // Unwrap first: reflecting the implicitly-unwrapped Optional would only expose `some`.
++        guard let liveStream = liveStream else { return nil }
++        let stream = Mirror(reflecting: liveStream).children.first { $0.label == "rtmpStream" }?.value as? RTMPStream
++        if stream == nil { NSLog("[ScoreOverlay] rtmpStream not found via reflection") }
++        return stream
++    }
++
++    @objc private func deviceOrientationDidChange() {
++        // The encoder size can't change mid-stream, so keep the orientation chosen at start.
++        guard !isStreaming, let stream = rtmpStream,
++              let orientation = DeviceUtil.videoOrientation(by: UIDevice.current.orientation),
++              orientation != stream.videoOrientation else { return }
++        stream.videoOrientation = orientation
++        // Re-apply the config so width/height are swapped for the new orientation.
++        liveStream.videoConfig = liveStream.videoConfig
++    }
++
++    /// HaishinKit only applies video effects in `.offscreen` mode (the default `.passthrough`
++    /// sends camera frames untouched), and the offscreen `Screen` must be sized like the encoder
++    /// output and started explicitly.
++    private func setOffscreenRendering(_ enabled: Bool, on stream: RTMPStream) {
++        var settings = stream.videoMixerSettings
++        if enabled {
++            stream.screen.size = stream.videoSettings.videoSize
++            stream.screen.frameRate = max(1, Int(stream.frameRate))
++            settings.mode = .offscreen
++            stream.videoMixerSettings = settings
++            stream.screen.startRunning()
++        } else {
++            settings.mode = .passthrough
++            stream.videoMixerSettings = settings
++            stream.screen.stopRunning()
++        }
++        NSLog("[ScoreOverlay] offscreen=%d size=%@", enabled ? 1 : 0, NSCoder.string(for: stream.screen.size))
++    }
++
++    /// `json` is `{"t1":"..","t2":"..","s1":0,"s2":0}`; an empty string removes the overlay.
++    @objc public func setScoreOverlay(_ json: String) {
++        NSLog("[ScoreOverlay] setScoreOverlay: %@", json)
++        guard let stream = rtmpStream else { return }
++
++        guard let data = json.data(using: .utf8),
++              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
++            if let effect = scoreEffect, isScoreEffectRegistered {
++                _ = stream.unregisterVideoEffect(effect)
++                setOffscreenRendering(false, on: stream)
++                isScoreEffectRegistered = false
++            }
++            return
++        }
++
++        let effect = scoreEffect ?? ScoreOverlayEffect()
++        scoreEffect = effect
++        effect.update(
++            team1: dict["t1"] as? String ?? "",
++            team2: dict["t2"] as? String ?? "",
++            score1: dict["s1"] as? Int ?? 0,
++            score2: dict["s2"] as? Int ?? 0
++        )
++        if !isScoreEffectRegistered {
++            setOffscreenRendering(true, on: stream)
++            isScoreEffectRegistered = stream.registerVideoEffect(effect)
++            NSLog("[ScoreOverlay] effect registered: %d", isScoreEffectRegistered ? 1 : 0)
++        }
+     }
+ 
+     @available(*, unavailable)
+diff --git a/node_modules/@api.video/react-native-livestream/ios/ScoreOverlayEffect.swift b/node_modules/@api.video/react-native-livestream/ios/ScoreOverlayEffect.swift
+new file mode 100644
+index 0000000..56f7e43
+--- /dev/null
++++ b/node_modules/@api.video/react-native-livestream/ios/ScoreOverlayEffect.swift
+@@ -0,0 +1,85 @@
++//
++//  ScoreOverlayEffect.swift
++//
++//  Draws a two-team score banner in the top-left corner of every video frame
++//  before it is encoded, so viewers of the stream see it.
++//
++
++import AVFoundation
++import CoreImage
++import HaishinKit
++import UIKit
++
++final class ScoreOverlayEffect: VideoEffect {
++    private let lock = NSLock()
++    private var banner: CIImage?
++
++    /// Re-renders the banner. Call from any thread.
++    func update(team1: String, team2: String, score1: Int, score2: Int) {
++        let image = ScoreOverlayEffect.render(team1: team1, team2: team2, score1: score1, score2: score2)
++        lock.lock()
++        banner = image
++        lock.unlock()
++    }
++
++    override func execute(_ image: CIImage, info _: CMSampleBuffer?) -> CIImage {
++        lock.lock()
++        let banner = self.banner
++        lock.unlock()
++        guard let banner = banner else { return image }
++
++        let extent = image.extent
++        // Portrait frames are narrow, so the banner takes a larger share of the width.
++        let widthRatio: CGFloat = extent.width < extent.height ? 0.55 : 0.32
++        let scale = (extent.width * widthRatio) / banner.extent.width
++        let margin = extent.width * 0.03
++        let scaled = banner.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
++        // Core Image's origin is bottom-left.
++        let moved = scaled.transformed(by: CGAffineTransform(
++            translationX: extent.minX + margin,
++            y: extent.maxY - margin - scaled.extent.height
++        ))
++        return moved.composited(over: image)
++    }
++
++    private static func render(team1: String, team2: String, score1: Int, score2: Int) -> CIImage? {
++        let size = CGSize(width: 720, height: 130)
++        let renderer = UIGraphicsImageRenderer(size: size, format: {
++            let format = UIGraphicsImageRendererFormat()
++            format.scale = 1
++            format.opaque = false
++            return format
++        }())
++
++        let image = renderer.image { _ in
++            UIColor(white: 0, alpha: 0.72).setFill()
++            UIBezierPath(roundedRect: CGRect(origin: .zero, size: size), cornerRadius: 28).fill()
++
++            func draw(_ text: String, in rect: CGRect, font: UIFont, align: NSTextAlignment) {
++                let style = NSMutableParagraphStyle()
++                style.alignment = align
++                style.lineBreakMode = .byTruncatingTail
++                let attributed = NSAttributedString(string: text, attributes: [
++                    .font: font,
++                    .foregroundColor: UIColor.white,
++                    .paragraphStyle: style,
++                ])
++                let height = attributed.size().height
++                attributed.draw(in: CGRect(x: rect.minX, y: rect.midY - height / 2, width: rect.width, height: height))
++            }
++
++            let nameFont = UIFont.systemFont(ofSize: 40, weight: .semibold)
++            let scoreFont = UIFont.systemFont(ofSize: 70, weight: .heavy)
++            let centerWidth: CGFloat = 200
++            let padding: CGFloat = 24
++            let nameWidth = (size.width - centerWidth - padding * 2) / 2
++
++            draw(team1, in: CGRect(x: padding, y: 0, width: nameWidth, height: size.height), font: nameFont, align: .right)
++            draw("\(score1) - \(score2)", in: CGRect(x: padding + nameWidth, y: 0, width: centerWidth, height: size.height), font: scoreFont, align: .center)
++            draw(team2, in: CGRect(x: padding + nameWidth + centerWidth, y: 0, width: nameWidth, height: size.height), font: nameFont, align: .left)
++        }
++
++        guard let cgImage = image.cgImage else { return nil }
++        return CIImage(cgImage: cgImage)
++    }
++}
+diff --git a/node_modules/@api.video/react-native-livestream/lib/typescript/index.d.ts b/node_modules/@api.video/react-native-livestream/lib/typescript/index.d.ts
+index e2a3b97..49aa776 100644
+--- a/node_modules/@api.video/react-native-livestream/lib/typescript/index.d.ts
++++ b/node_modules/@api.video/react-native-livestream/lib/typescript/index.d.ts
+@@ -19,6 +19,7 @@ type ApiVideoLiveStreamProps = {
+     };
+     zoomRatio?: number;
+     enablePinchedZoom?: boolean;
++    scoreOverlay?: string;
+     onConnectionSuccess?: () => void;
+     onConnectionFailed?: (code: string) => void;
+     onDisconnect?: () => void;
+diff --git a/node_modules/@api.video/react-native-livestream/src/NativeApiVideoLiveStreamView.ts b/node_modules/@api.video/react-native-livestream/src/NativeApiVideoLiveStreamView.ts
+index 262fd04..b67f7d8 100644
+--- a/node_modules/@api.video/react-native-livestream/src/NativeApiVideoLiveStreamView.ts
++++ b/node_modules/@api.video/react-native-livestream/src/NativeApiVideoLiveStreamView.ts
+@@ -45,6 +45,8 @@ export interface NativeLiveStreamProps extends ViewProps {
+   };
+   zoomRatio: Float;
+   enablePinchedZoom: boolean;
++  // JSON string, empty = hidden. Burned into the video on iOS.
++  scoreOverlay?: string;
+ 
+   onConnectionSuccess?: DirectEventHandler<null>;
+   onConnectionFailed?: DirectEventHandler<OnConnectionFailedEvent>;
+diff --git a/node_modules/@api.video/react-native-livestream/src/index.tsx b/node_modules/@api.video/react-native-livestream/src/index.tsx
+index 677b097..73d09d2 100644
+--- a/node_modules/@api.video/react-native-livestream/src/index.tsx
++++ b/node_modules/@api.video/react-native-livestream/src/index.tsx
+@@ -29,6 +29,8 @@ type ApiVideoLiveStreamProps = {
+   };
+   zoomRatio?: number;
+   enablePinchedZoom?: boolean;
++  /** JSON string; empty hides the overlay. iOS only: drawn into the video frames. */
++  scoreOverlay?: string;
+ 
+   onConnectionSuccess?: () => void;
+   onConnectionFailed?: (code: string) => void;
+@@ -208,6 +210,7 @@ const ApiVideoLiveStreamView = forwardRef<
+       audio={nativeLiveStreamProps.audio}
+       zoomRatio={nativeLiveStreamProps.zoomRatio}
+       enablePinchedZoom={nativeLiveStreamProps.enablePinchedZoom}
++      scoreOverlay={nativeLiveStreamProps.scoreOverlay}
+       onConnectionSuccess={nativeLiveStreamProps.onConnectionSuccess}
+       onConnectionFailed={nativeLiveStreamProps.onConnectionFailed}
+       onDisconnect={nativeLiveStreamProps.onDisconnect}

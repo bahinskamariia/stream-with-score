@@ -1,6 +1,18 @@
 {
-  "extends": "expo/tsconfig.base",
+  "extends": "@react-native/typescript-config",
+  "include": [
+    "**/*.ts",
+    "**/*.tsx"
+  ],
+  "exclude": [
+    "**/node_modules",
+    "**/Pods"
+  ],
   "compilerOptions": {
-    "strict": true
+    "paths": {
+      "@api.video/react-native-livestream": [
+        "./node_modules/@api.video/react-native-livestream/lib/typescript/index.d.ts"
+      ]
+    }
   }
 }
