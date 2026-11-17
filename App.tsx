@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { launchImageLibrary } from 'react-native-image-picker';
 import {
   Alert,
+  AppState,
   Image,
   Linking,
   Platform,
@@ -50,6 +51,10 @@ export default function App() {
   // Set when the RTMP connection is established; drives the duration timer.
   const [startedAt, setStartedAt] = useState<number | null>(null);
   const [now, setNow] = useState(Date.now());
+  // False while the RTMP link is down (e.g. app in background); the session itself stays alive.
+  const [connected, setConnected] = useState(false);
+  const sessionRef = useRef<LiveSession | null>(null);
+  const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [busy, setBusy] = useState(false);
   const [streamError, setStreamError] = useState<string | null>(null);
 
@@ -78,10 +83,45 @@ export default function App() {
     return () => clearInterval(id);
   }, [startedAt]);
 
+  useEffect(() => {
+    sessionRef.current = session;
+  }, [session]);
+
+  const clearRetry = () => {
+    if (retryTimer.current) clearTimeout(retryTimer.current);
+    retryTimer.current = null;
+  };
+
   const resetSession = () => {
+    clearRetry();
+    sessionRef.current = null;
     setSession(null);
     setStartedAt(null);
+    setConnected(false);
   };
+
+  // Re-opens the RTMP connection with the same stream key; the YouTube broadcast is untouched.
+  const reconnect = useCallback(() => {
+    clearRetry();
+    const s = sessionRef.current;
+    if (!s || AppState.currentState !== 'active') return;
+    streamRef.current?.startStreaming(s.streamName, s.ingestionAddress);
+  }, []);
+
+  // Link dropped but the user hasn't stopped: keep the session and keep retrying.
+  const onLinkLost = useCallback(() => {
+    setConnected(false);
+    if (!sessionRef.current) return;
+    clearRetry();
+    retryTimer.current = setTimeout(reconnect, 3000);
+  }, [reconnect]);
+
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', state => {
+      if (state === 'active' && sessionRef.current) reconnect();
+    });
+    return () => sub.remove();
+  }, [reconnect]);
 
   const pickThumbnail = async () => {
     const res = await launchImageLibrary({
@@ -105,6 +145,7 @@ export default function App() {
       );
       setScore1(0);
       setScore2(0);
+      sessionRef.current = s;
       setSession(s);
       if (thumbnail) {
         // A thumbnail failure should not block the stream.
@@ -147,10 +188,14 @@ export default function App() {
 
   const stopLive = async () => {
     setBusy(true);
+    clearRetry();
+    const ended = sessionRef.current;
+    // Clear first so the disconnect callback doesn't trigger a reconnect.
+    sessionRef.current = null;
     streamRef.current?.stopStreaming();
     try {
-      if (session)
-        await endBroadcast(await getAccessToken(), session.broadcastId);
+      if (ended)
+        await endBroadcast(await getAccessToken(), ended.broadcastId);
     } catch (e) {
       setStreamError((e as Error).message);
     } finally {
@@ -194,11 +239,16 @@ export default function App() {
         }}
         audio={{ bitrate: 128000, sampleRate: 44100, isStereo: true }}
         onConnectionFailed={code => {
+          if (!sessionRef.current) return;
           setStreamError(`Connection failed: ${code}`);
-          resetSession();
+          onLinkLost();
         }}
-        onConnectionSuccess={() => setStartedAt(Date.now())}
-        onDisconnect={resetSession}
+        onConnectionSuccess={() => {
+          setStreamError(null);
+          setConnected(true);
+          setStartedAt(prev => prev ?? Date.now());
+        }}
+        onDisconnect={onLinkLost}
       />
       {!session && (
         <SafeAreaView
@@ -286,7 +336,9 @@ export default function App() {
             <Pressable onPress={() => Linking.openURL(session.watchUrl)}>
               <Text style={styles.live}>
                 {startedAt
-                  ? `● LIVE ${formatDuration(now - startedAt)}`
+                  ? connected
+                    ? `● LIVE ${formatDuration(now - startedAt)}`
+                    : 'Reconnecting…'
                   : 'Connecting…'}{' '}
                 — tap to open on YouTube
               </Text>

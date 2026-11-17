@@ -31,7 +31,7 @@ export async function createLiveSession(
   const broadcast = await call<{ id: string }>(token, 'liveBroadcasts?part=snippet,contentDetails,status', {
     snippet: { title, scheduledStartTime: new Date().toISOString() },
     status: { privacyStatus, selfDeclaredMadeForKids: false },
-    contentDetails: { enableAutoStart: true, enableAutoStop: true },
+    contentDetails: { enableAutoStart: true, enableAutoStop: false },
   });
 
   const stream = await call<{
